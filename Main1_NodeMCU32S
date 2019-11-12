@@ -1,0 +1,1243 @@
+// Config
+// - [ ] Config RTC module
+// - [ ] Config intervalTime
+// - [ ] Config DeviceId
+// - [ ] Config Name
+// - [ ] Config Mode
+// - [ ] Config WIFI password
+#include <Arduino.h>
+#include "esp_system.h"
+#include "WiFi.h"
+#include "ESPAsyncWebServer.h"
+#include "SPIFFS.h"
+#include <ArduinoJson.h>
+#include "AIS_NB_BC95_ESP32.h"
+#include <Wire.h>
+#include "SHT21.h"
+#include "RTClib.h"
+#include <SPI.h>
+#include <SD.h>
+#include <math.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+  uint8_t temprature_sens_read();
+
+#ifdef __cplusplus
+}
+#endif
+
+#define DEBUG 1
+
+// Set GPIO
+#define SW_CONFIG 16
+#define PIN_WINDSPEED 36
+#define PIN_WINDDIR 25
+#define PIN_RAIN 33
+#define PIN_SOLAR_RADIATION 39
+#define PIN_SOIL_MOISTURE_VALUE_01 34
+#define PIN_SOIL_MOISTURE_VALUE_02 35
+#define PIN_SOIL_MOISTURE_VALUE_03 32
+#define PIN_WATER_LEVEL 17
+
+// Reserved I2C_PIN for SHT21 and RTC
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Reserved HSPI_PIN for SDCard Module
+#define SCK_PIN 18
+#define MISO_PIN 19
+#define MOSI_PIN 23
+#define SS_PIN 5
+
+// Reserved Serial port for NBIoT
+#define RXD1 9
+#define TXD1 10
+
+String SERVER_PORT = "6000";
+String SERVER_IP = "68.183.189.135";
+
+const char *SSID = "Weather Station";
+const char *PASSWORD = "123456789";
+
+volatile unsigned long ContactBounceTime1;
+volatile unsigned long ContactBounceTime2;
+
+// NB_IoT
+AIS_NB_BC95 NB;
+
+String SOFTWARE_VERSION = "1.0";
+String DEVICE_TITLE = "ESP32 Device";
+String DEVICE_NAME = "ESP32_Device";
+String EVENT_LIST = "";
+
+//measured
+int SOIL_MOISTURE_VALUE_01 = 0;
+int SOIL_MOISTURE_VALUE_02 = 0;
+int SOIL_MOISTURE_VALUE_03 = 0;
+
+double RAIN_VALUE = 0;
+int RAIN_COUNTER = 0;
+double WATER_LEVEL_VALUE = 0;
+
+int SOLAR_RADIATION_VALUE = 0;
+
+double TEMPERATURE_VALUE = 0;
+double HUMIDITY_VALUE = 0;
+
+int WIND_DIR_VALUE = 0;
+
+double WINDSPEED_VALUE = 0;
+int WINDSPEED_COUNTER = 0;
+unsigned long WINDSPEED_TIME_START = 0;
+unsigned long WINDSPEED_TIME_STOP = 5000;
+unsigned long WINDSPEED_TIME_OFFSET = 0;
+bool WINDSPEED_ISSAMPLING = false;
+
+int TIME_COUNTER = 0;
+int TIME_WAKEUP = 1 * 60 * 1000 * 1000;
+bool isConfig = false;
+
+//wifi
+String WIFI_SSID = "NNBP_WSCU";
+String WIFI_PASSWORD = "88888888";
+hw_timer_t *TIME_INTERVAL = NULL;
+
+//interval time
+int CONFIG_INTERVAL_TIME = 120; //sec
+
+// RTC
+RTC_DS3231 rtc;
+
+int RTC_YEAR = 2019;
+int RTC_MONTH = 3;
+int RTC_DATE = 31;
+int RTC_DAY = 1;
+int RTC_HOURS = 15;
+int RTC_MINUTES = 02;
+int RTC_SECONDS = 30;
+
+// SHT-21
+SHT21 SHT21;
+
+//mqtt
+String SERIAL_NUMBER = "";
+
+bool IS_REBOOT = false;
+
+//SYS
+int SYS_MODE = 0;               //0 = Default , 1 = CONFIG , 2 = DEBUG
+int SYS_COMMUNICATION_MODE = 1; //0 = ZIBEE , 1 = NB-IOT , 2  = WIFI
+int SYS_SDCARD_CONNECTED = 0;
+double SYS_VBAT = 0;
+double SYS_AVG_CURRENT_CHARGER = 0;
+long SYS_UPTIME = 0;
+double SYS_CPU_TEMPERATURE = 0;
+String SYS_TIME = String(RTC_YEAR) + "/" + String(RTC_MONTH) + "/" + String(RTC_DATE) + " " + String(RTC_HOURS) + ":" + String(RTC_MINUTES) + ":" + String(RTC_SECONDS);
+
+String SYS_APPID = "WSCU01";
+String SYS_KEY = "wnOUMLGorTMQW7h";
+String SYS_SECRET = "r8nouAEvEkuu5EftJSwUIQRAc";
+
+// Data for UDP
+String payload = "";
+
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+WiFiClient wifiClient;
+
+void initRTC()
+{
+  if (!rtc.begin())
+  {
+    Serial.println("Couldn't find RTC");
+  }
+}
+
+void setRTC()
+{
+  rtc.adjust(DateTime(RTC_YEAR, RTC_MONTH, RTC_DATE, RTC_HOURS, RTC_MINUTES, RTC_SECONDS));
+}
+
+void readRTC()
+{
+  DateTime now = rtc.now();
+
+  RTC_YEAR = now.year();
+  RTC_MONTH = now.month();
+  RTC_DATE = now.day();
+  RTC_HOURS = now.hour();
+  RTC_MINUTES = now.minute();
+  RTC_SECONDS = now.second();
+
+  SYS_TIME = String(RTC_YEAR) + "/" + String(RTC_MONTH) + "/" + String(RTC_DATE) + " " + String(RTC_HOURS) + ":" + String(RTC_MINUTES) + ":" + String(RTC_SECONDS);
+}
+
+void writeEvent(String msg)
+{
+  File file = SPIFFS.open("/sys_event.txt", FILE_APPEND);
+  if (!file)
+  {
+
+    Serial.println("There was an error opening the file for writing");
+  }
+  if (file.println(msg))
+  {
+
+    Serial.println("sys_event.txt ,message appended");
+  }
+  else
+  {
+
+    Serial.println("sys_event.txt ,append failed");
+  }
+  file.close();
+}
+
+void initIntervalTime()
+{
+  String path = "/sys_config_interval_time.txt";
+  Serial.println("init from file :" + path);
+  File file = SPIFFS.open(path);
+  if (!file)
+  {
+    Serial.println("ERROR::failed to open file for reading");
+    return;
+  }
+  String str = "";
+  while (file.available())
+  {
+    char c = file.read();
+    if (c == '\n')
+    {
+      String key = str.substring(0, str.indexOf("::"));
+      String value = str.substring(str.indexOf("::") + 2, str.length());
+      if (key == "CONFIG_INTERVAL_TIME")
+      {
+        CONFIG_INTERVAL_TIME = (value != "") ? value.toInt() : CONFIG_INTERVAL_TIME;
+        Serial.print(key);
+        Serial.print("=");
+        Serial.println(CONFIG_INTERVAL_TIME);
+      }
+
+      str = "";
+    }
+    else if (c == '#')
+    {
+      //comment or disable
+    }
+    else
+    {
+      str += c;
+    }
+  }
+  file.close();
+}
+
+void initDateTime()
+{
+  String path = "/sys_datetime.txt";
+
+  Serial.println("init from file :" + path);
+
+  File file = SPIFFS.open(path);
+  if (!file)
+  {
+
+    Serial.println("ERROR::failed to open file for reading");
+
+    return;
+  }
+  String str = "";
+  while (file.available())
+  {
+    char c = file.read();
+    if (c == '\n')
+    {
+      String key = str.substring(0, str.indexOf("::"));
+      String value = str.substring(str.indexOf("::") + 2, str.length());
+      if (key == "RTC_YEAR")
+      {
+        RTC_YEAR = (value != "") ? value.toInt() : RTC_YEAR;
+        Serial.print(key);
+        Serial.print("=");
+        Serial.println(RTC_YEAR);
+      }
+
+      if (key == "RTC_MONTH")
+      {
+        RTC_MONTH = (value != "") ? value.toInt() : RTC_MONTH;
+        Serial.print(key);
+        Serial.print("=");
+        Serial.println(RTC_MONTH);
+      }
+
+      if (key == "RTC_DATE")
+      {
+        RTC_DATE = (value != "") ? value.toInt() : RTC_DATE;
+        Serial.print(key);
+        Serial.print("=");
+        Serial.println(RTC_DATE);
+      }
+
+      if (key == "RTC_DAY")
+      {
+        RTC_DAY = (value != "") ? value.toInt() : RTC_DAY;
+        Serial.print(key);
+        Serial.print("=");
+        Serial.println(RTC_DAY);
+      }
+
+      if (key == "RTC_HOURS")
+      {
+        RTC_HOURS = (value != "") ? value.toInt() : RTC_HOURS;
+        Serial.print(key);
+        Serial.print("=");
+        Serial.println(RTC_HOURS);
+      }
+
+      if (key == "RTC_MINUTES")
+      {
+        RTC_MINUTES = (value != "") ? value.toInt() : RTC_MINUTES;
+        Serial.print(key);
+        Serial.print("=");
+        Serial.println(RTC_MINUTES);
+      }
+
+      if (key == "RTC_SECONDS")
+      {
+        RTC_SECONDS = (value != "") ? value.toInt() : RTC_SECONDS;
+        Serial.print(key);
+        Serial.print("=");
+        Serial.println(RTC_SECONDS);
+      }
+
+      str = "";
+    }
+    else if (c == '#')
+    {
+      //comment or disable
+    }
+    else
+    {
+      str += c;
+    }
+  }
+  file.close();
+}
+
+void initEvent()
+{
+  String path = "/sys_event.txt";
+
+  Serial.println("init from file :" + path);
+
+  File file = SPIFFS.open(path);
+  if (!file)
+  {
+
+    Serial.println("ERROR::failed to open file for reading");
+
+    return;
+  }
+  String str = "";
+  EVENT_LIST = "";
+  while (file.available())
+  {
+    char c = file.read();
+    if (c == '\n')
+    {
+
+      Serial.println(str);
+
+      EVENT_LIST += str + "<br>";
+      str = "";
+    }
+    else
+    {
+      str += c;
+    }
+  }
+  file.close();
+}
+
+void initSetup()
+{
+  String path = "/setup.txt";
+
+  Serial.println("init from file :" + path);
+
+  File file = SPIFFS.open(path);
+  if (!file)
+  {
+
+    Serial.println("ERROR::failed to open file for reading");
+
+    return;
+  }
+  String str = "";
+  while (file.available())
+  {
+    char c = file.read();
+    if (c == '\n')
+    {
+      String key = str.substring(0, str.indexOf("::"));
+      String value = str.substring(str.indexOf("::") + 2, str.length());
+      if (key == "DEVICE_TITLE")
+      {
+        DEVICE_TITLE = (value != "") ? value : DEVICE_TITLE;
+
+        Serial.println(key + "=" + DEVICE_TITLE);
+      }
+
+      if (key == "DEVICE_NAME")
+      {
+        DEVICE_NAME = (value != "") ? value : DEVICE_NAME;
+
+        Serial.println(key + "=" + DEVICE_NAME);
+      }
+
+      if (key == "SERIAL_NUMBER")
+      {
+        SERIAL_NUMBER = (value != "") ? value : SERIAL_NUMBER;
+
+        Serial.println(key + "=" + SERIAL_NUMBER);
+      }
+
+      if (key == "SERVER_IP")
+      {
+        SERVER_IP = (value != "") ? value : SERVER_IP;
+
+        Serial.println(key + "=" + SERVER_IP);
+      }
+
+      if (key == "SERVER_PORT")
+      {
+        SERVER_PORT = (value != "") ? value : SERVER_PORT;
+
+        Serial.println(key + "=" + SERVER_PORT);
+      }
+      str = "";
+    }
+    else if (c == '#')
+    {
+      //comment or disable
+    }
+    else
+    {
+      str += c;
+    }
+  }
+  file.close();
+}
+
+void initConfigMode()
+{
+  // Wi-Fi
+  char ssid1[15];
+  char ssid2[15];
+
+  uint64_t chipid = ESP.getEfuseMac(); // The chip ID is essentially its MAC address(length: 6 bytes).
+  uint16_t chip = (uint16_t)(chipid >> 32);
+
+  snprintf(ssid1, 15, "%04X", chip);
+  snprintf(ssid2, 15, "%08X", (uint32_t)chipid);
+  SERIAL_NUMBER = String(ssid1)+String(ssid2);
+  DEVICE_NAME = String(SSID) + "_" + SERIAL_NUMBER;
+
+  if (!WiFi.softAPConfig(IPAddress(192, 168, 1, 1), IPAddress(192, 168, 1, 1), IPAddress(255, 255, 255, 0)))
+  {
+    Serial.println("AP Config Failed");
+  }
+  WiFi.softAP(DEVICE_NAME.c_str(), PASSWORD, random(1, 12), 0, 2);
+
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Route to load style.css file
+  server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/style.css", "text/css");
+  });
+  //Route
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/index.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "DEVICE_NAME")
+        return String(DEVICE_NAME);
+      if (var == "SERIAL_NUMBER")
+        return String(SERIAL_NUMBER);
+      if (var == "SOFTWARE_VERSION")
+        return String(SOFTWARE_VERSION);
+
+      if (var == "WINDSPEED_VALUE")
+        return String(WINDSPEED_VALUE);
+      if (var == "WIND_DIR_VALUE")
+        return String(WIND_DIR_VALUE);
+      if (var == "RAIN_COUNTER")
+        return String(RAIN_COUNTER);
+      if (var == "SOLAR_RADIATION_VALUE")
+        return String(SOLAR_RADIATION_VALUE);
+      if (var == "TEMPERATURE_VALUE")
+        return String(TEMPERATURE_VALUE);
+      if (var == "HUMIDITY_VALUE")
+        return String(HUMIDITY_VALUE);
+      if (var == "SOIL_MOISTURE_VALUE_01")
+        return String(SOIL_MOISTURE_VALUE_01);
+      if (var == "SOIL_MOISTURE_VALUE_01")
+        return String(SOIL_MOISTURE_VALUE_01);
+      if (var == "SOIL_MOISTURE_VALUE_01")
+        return String(SOIL_MOISTURE_VALUE_01);
+      if (var == "WATER_LEVEL_VALUE")
+        return String(WATER_LEVEL_VALUE);
+      if (var == "DATE_TIME")
+      {
+        String DATE_TIME = "";
+        return String(DATE_TIME);
+      }
+      return String();
+    });
+  });
+
+  server.on("/setup", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/setup.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "DEVICE_TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "DEVICE_NAME")
+        return String(DEVICE_NAME);
+
+      if (var == "SERIAL_NUMBER")
+        return String(SERIAL_NUMBER);
+      if (var == "SERVER_IP")
+        return String(SERVER_IP);
+      if (var == "SERVER_PORT")
+        return String(SERVER_PORT);
+      if (var == "DATE_TIME")
+      {
+        String DATE_TIME = "";
+        return String(DATE_TIME);
+      }
+      return String();
+    });
+  });
+
+  server.on("/datetime", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/datetime.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "RTC_YEAR")
+        return String(RTC_YEAR);
+      if (var == "RTC_MONTH")
+        return String(RTC_MONTH);
+      if (var == "RTC_DATE")
+        return String(RTC_DATE);
+      if (var == "RTC_DAY")
+        return String(RTC_DAY);
+      if (var == "RTC_HOURS")
+        return String(RTC_HOURS);
+      if (var == "RTC_MINUTES")
+        return String(RTC_MINUTES);
+      if (var == "RTC_SECONDS")
+        return String(RTC_SECONDS);
+      return String();
+    });
+  });
+
+  server.on("/communication", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/communication.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      return String();
+    });
+  });
+
+  server.on("/intervaltime", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/intervaltime.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "CONFIG_INTERVAL_TIME")
+        return String(CONFIG_INTERVAL_TIME);
+      return String();
+    });
+  });
+
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/reset.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      return String();
+    });
+  });
+
+  server.on("/event", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // initEvent();
+    request->send(SPIFFS, "/event.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "EVENT_LIST")
+        return String(EVENT_LIST);
+      return String();
+    });
+  });
+  //Router POST
+  server.on("/setup", HTTP_POST, [](AsyncWebServerRequest *request) {
+    File file = SPIFFS.open("/setup.txt", FILE_WRITE);
+    if (!file)
+    {
+      Serial.println("There was an error opening the file for writing");
+    }
+    for (byte i = 1; i <= request->params(); i++)
+    {
+      AsyncWebParameter *p = request->getParam(request->params() - i);
+      if (p->name() == "DEVICE_TITLE")
+      {
+        DEVICE_TITLE = (p->value() != "") ? p->value() : DEVICE_TITLE;
+        if (file.println("DEVICE_TITLE::" + DEVICE_TITLE))
+        {
+          Serial.println("File was written");
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "DEVICE_NAME")
+      {
+        DEVICE_NAME = (p->value() != "") ? p->value() : DEVICE_NAME;
+        if (file.println("DEVICE_NAME::" + DEVICE_NAME))
+        {
+          Serial.println("File was written");
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "SERIAL_NUMBER")
+      {
+        SERIAL_NUMBER = (p->value() != "") ? p->value() : SERIAL_NUMBER;
+        if (file.println("SERIAL_NUMBER::" + SERIAL_NUMBER))
+        {
+          Serial.println("File was written");
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "SERVER_IP")
+      {
+        SERVER_IP = (p->value() != "") ? p->value() : SERVER_IP;
+        if (file.println("SERVER_IP::" + SERVER_IP))
+        {
+          Serial.println("File was written");
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "SERVER_PORT")
+      {
+        SERVER_PORT = (p->value() != "") ? p->value() : SERVER_PORT;
+        if (file.println("SERVER_PORT::" + SERVER_PORT))
+        {
+          Serial.println("File was written");
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else
+      {
+      }
+    }
+    file.close();
+    writeEvent("{datetime},{status},{event type},{event description},{value}");
+    request->send(SPIFFS, "/setup.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "DEVICE_TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "DEVICE_NAME")
+        return String(DEVICE_NAME);
+      if (var == "SERIAL_NUMBER")
+        return String(SERIAL_NUMBER);
+      if (var == "SERVER_IP")
+        return String(SERVER_IP);
+      if (var == "SERVER_PORT")
+        return String(SERVER_PORT);
+      return String();
+    });
+  });
+
+  server.on("/intervaltime", HTTP_POST, [](AsyncWebServerRequest *request) {
+    File file = SPIFFS.open("/sys_config_interval_time.txt", FILE_WRITE);
+    if (!file)
+    {
+      Serial.println("There was an error opening the file for writing");
+    }
+    for (byte i = 1; i <= request->params(); i++)
+    {
+      AsyncWebParameter *p = request->getParam(request->params() - i);
+      if (p->name() == "CONFIG_INTERVAL_TIME")
+      {
+        CONFIG_INTERVAL_TIME = (p->value() != "") ? p->value().toInt() : CONFIG_INTERVAL_TIME;
+        if (file.print("CONFIG_INTERVAL_TIME::") && file.println(CONFIG_INTERVAL_TIME))
+        {
+          Serial.print("CONFIG_INTERVAL_TIME::");
+          Serial.println(CONFIG_INTERVAL_TIME);
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else
+      {
+      }
+    }
+    file.close();
+    writeEvent("{datetime},{status},{event type},{event description},{value}");
+    request->send(SPIFFS, "/intervaltime.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "CONFIG_INTERVAL_TIME")
+        return String(CONFIG_INTERVAL_TIME);
+      return String();
+    });
+  });
+
+  server.on("/datetime", HTTP_POST, [](AsyncWebServerRequest *request) {
+    File file = SPIFFS.open("/sys_datetime.txt", FILE_WRITE);
+    if (!file)
+    {
+      Serial.println("There was an error opening the file for writing");
+    }
+    for (byte i = 1; i <= request->params(); i++)
+    {
+      AsyncWebParameter *p = request->getParam(request->params() - i);
+      if (p->name() == "RTC_YEAR")
+      {
+        RTC_YEAR = (p->value() != "") ? p->value().toInt() : RTC_YEAR;
+        if (file.print("RTC_YEAR::") && file.println(RTC_YEAR))
+        {
+          Serial.print("RTC_YEAR::");
+          Serial.println(RTC_YEAR);
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "RTC_MONTH")
+      {
+        RTC_MONTH = (p->value() != "") ? p->value().toInt() : RTC_MONTH;
+        if (file.print("RTC_MONTH::") && file.println(RTC_MONTH))
+        {
+          Serial.print("RTC_MONTH::");
+          Serial.println(RTC_MONTH);
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "RTC_DATE")
+      {
+        RTC_DATE = (p->value() != "") ? p->value().toInt() : RTC_DATE;
+        if (file.print("RTC_DATE::") && file.println(RTC_DATE))
+        {
+          Serial.print("RTC_DATE::");
+          Serial.println(RTC_DATE);
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "RTC_DAY")
+      {
+        RTC_DAY = (p->value() != "") ? p->value().toInt() : RTC_DAY;
+        if (file.print("RTC_DAY::") && file.println(RTC_DAY))
+        {
+          Serial.print("RTC_DAY::");
+          Serial.println(RTC_DAY);
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "RTC_HOURS")
+      {
+        RTC_HOURS = (p->value() != "") ? p->value().toInt() : RTC_HOURS;
+        if (file.print("RTC_HOURS::") && file.println(RTC_HOURS))
+        {
+          Serial.print("RTC_HOURS::");
+          Serial.println(RTC_HOURS);
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "RTC_MINUTES")
+      {
+        RTC_MINUTES = (p->value() != "") ? p->value().toInt() : RTC_MINUTES;
+        if (file.print("RTC_MINUTES::") && file.println(RTC_MINUTES))
+        {
+          Serial.print("RTC_MINUTES::");
+          Serial.println(RTC_MINUTES);
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else if (p->name() == "RTC_SECONDS")
+      {
+        RTC_SECONDS = (p->value() != "") ? p->value().toInt() : RTC_SECONDS;
+        if (file.print("RTC_SECONDS::") && file.println(RTC_SECONDS))
+        {
+          Serial.print("RTC_SECONDS::");
+          Serial.println(RTC_SECONDS);
+        }
+        else
+        {
+          Serial.println("File write failed");
+        }
+      }
+      else
+      {
+      }
+    }
+    file.close();
+    writeEvent("{datetime},{status},{event type},{event description},{value}");
+    request->send(SPIFFS, "/datetime.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "RTC_YEAR")
+        return String(RTC_YEAR);
+      if (var == "RTC_MONTH")
+        return String(RTC_MONTH);
+      if (var == "RTC_DATE")
+        return String(RTC_DATE);
+      if (var == "RTC_DAY")
+        return String(RTC_DAY);
+      if (var == "RTC_HOURS")
+        return String(RTC_HOURS);
+      if (var == "RTC_MINUTES")
+        return String(RTC_MINUTES);
+      if (var == "RTC_SECONDS")
+        return String(RTC_SECONDS);
+      return String();
+    });
+  });
+
+  server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *request) {
+    Serial.println("ESP32 Reboot....");
+    request->send(200, "text/plain", "ESP32 Reboot....");
+    setRTC();
+    ESP.restart();
+  });
+
+  server.on("/resetdevice", HTTP_POST, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/loading.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      if (var == "REBOOT")
+      {
+        IS_REBOOT = true;
+      }
+      return String();
+    });
+  });
+  server.on("/factoryreset", HTTP_POST, [](AsyncWebServerRequest *request) {
+    request->send(SPIFFS, "/loading.html", String(), false, [](const String &var) {
+      if (var == "TITLE")
+        return String(DEVICE_TITLE);
+      return String();
+    });
+  });
+  // Start server
+  server.begin();
+}
+
+void init()
+{
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("An Error has occurred while mounting SPIFFS");
+  }
+}
+
+void connectToWifi()
+{
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.begin(WIFI_SSID.c_str(), WIFI_PASSWORD.c_str());
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(2000);
+    Serial.println("Connecting to WiFi..");
+  }
+  Serial.println("Connected to the WiFi network");
+}
+
+void rainHanler()
+{
+  if ((millis() - ContactBounceTime1) > 15)
+  {
+    RAIN_COUNTER++;
+    ContactBounceTime1 = millis();
+  }
+}
+
+void windSpeedHanler()
+{
+  if (WINDSPEED_TIME_START >= WINDSPEED_TIME_STOP)
+  {
+    detachInterrupt(PIN_WINDSPEED);
+    WINDSPEED_VALUE = WINDSPEED_COUNTER * (2.25 / (WINDSPEED_TIME_START / 1000));
+    // Serial.print("WINDSPEED_VALUE::");
+    // Serial.println(WINDSPEED_VALUE);
+    WINDSPEED_ISSAMPLING = false;
+    return;
+  }
+  if ((millis() - ContactBounceTime2) > 15)
+  {
+    WINDSPEED_COUNTER++;
+    ContactBounceTime2 = millis();
+  }
+}
+
+void windSpeedSampling()
+{
+  //  V = P(2.25/T)
+  //  V = speed in mph
+  //  P = no. of pulses per sample period
+  //  T = sample period in seconds
+  WINDSPEED_TIME_START = millis() - WINDSPEED_TIME_OFFSET;
+  if (WINDSPEED_ISSAMPLING)
+    return;
+  WINDSPEED_COUNTER = 0;
+  WINDSPEED_TIME_STOP = 5000;
+  WINDSPEED_TIME_OFFSET = millis();
+  WINDSPEED_TIME_START = millis() - WINDSPEED_TIME_OFFSET;
+  WINDSPEED_ISSAMPLING = true;
+  attachInterrupt(digitalPinToInterrupt(PIN_WINDSPEED), windSpeedHanler, FALLING);
+}
+
+void createDataSet()
+{
+  payload += "[0]::";
+  payload += String(SYS_APPID);
+  payload += ",";
+  payload += "[1]::";
+  payload += String(SYS_KEY);
+  payload += ",";
+  payload += "[2]::";
+  payload += String(SYS_SECRET);
+  payload += ",";
+  payload += "[3]::";
+  payload += String(SERIAL_NUMBER);
+  payload += ",";
+  payload += "[4]::";
+  payload += String(SYS_COMMUNICATION_MODE);
+  payload += ",";
+  payload += "[5]::";
+  payload += String(SYS_SDCARD_CONNECTED);
+  payload += ",";
+  payload += "[6]::";
+  payload += String(SYS_VBAT);
+  payload += ",";
+  payload += "[7]::";
+  payload += String(SYS_AVG_CURRENT_CHARGER);
+  payload += ",";
+  payload += "[8]::";
+  payload += String(SYS_UPTIME);
+  payload += ",";
+  payload += "[9]::";
+  payload += String(SYS_CPU_TEMPERATURE);
+  payload += ",";
+  payload += "[10]::";
+  payload += String(SYS_TIME);
+  payload += ",";
+  payload += "[11]::";
+  payload += String(WINDSPEED_VALUE);
+  payload += ",";
+  payload += "[12]::";
+  payload += String(WIND_DIR_VALUE);
+  payload += ",";
+  payload += "[13]::";
+  payload += String(RAIN_COUNTER);
+  payload += ",";
+  payload += "[14]::";
+  payload += String(SOLAR_RADIATION_VALUE);
+  payload += ",";
+  payload += "[15]::";
+  payload += String(TEMPERATURE_VALUE);
+  payload += ",";
+  payload += "[16]::";
+  payload += String(HUMIDITY_VALUE);
+  payload += ",";
+  payload += "[17]::";
+  payload += String(SOIL_MOISTURE_VALUE_01);
+  payload += ",";
+  payload += "[18]::";
+  payload += String(SOIL_MOISTURE_VALUE_02);
+  payload += ",";
+  payload += "[19]::";
+  payload += String(SOIL_MOISTURE_VALUE_03);
+  payload += ",";
+  payload += "[20]::";
+  payload += String(WATER_LEVEL_VALUE);
+  payload += ",";
+}
+
+void sendData()
+{
+
+  String deviceIMEI = NB.getIMEI();
+  deviceIMEI.trim();
+
+  payload += "[21]::";
+  payload += String(deviceIMEI);
+  payload += ",";
+  payload += "[22]::";
+  payload += String(NB.getSignal().rssi);
+  payload += ",";
+
+  UDPSend udp = NB.sendUDPmsgStr(SERVER_IP, SERVER_PORT, String(payload));
+  UDPReceive resp = NB.waitResponse();
+}
+
+void intervalTimeHandler()
+{
+  // TIME_COUNTER += (TIME_WAKEUP / 1000 / 1000);
+  // SYS_UPTIME += (TIME_WAKEUP / 1000 / 1000);
+  TIME_COUNTER++;
+  SYS_UPTIME++;
+}
+
+void initRunMode0()
+{
+  Serial.println("Run Mode 0");
+  WiFi.mode(WIFI_OFF);
+  pinMode(PIN_WINDSPEED, INPUT_PULLUP);
+  pinMode(PIN_RAIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_RAIN), rainHanler, FALLING);
+
+  TIME_INTERVAL = timerBegin(0, 80, true);
+  timerAttachInterrupt(TIME_INTERVAL, intervalTimeHandler, true);
+  timerAlarmWrite(TIME_INTERVAL, 1000000, true);
+  timerAlarmEnable(TIME_INTERVAL);
+}
+
+void initRunMode1()
+{
+  Serial.println("Run Mode 1");
+  WiFi.mode(WIFI_OFF);
+  pinMode(PIN_WINDSPEED, INPUT_PULLUP);
+  pinMode(PIN_RAIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_RAIN), rainHanler, FALLING);
+
+  TIME_INTERVAL = timerBegin(0, 80, true);
+  timerAttachInterrupt(TIME_INTERVAL, intervalTimeHandler, true);
+  timerAlarmWrite(TIME_INTERVAL, 1000000, true);
+  timerAlarmEnable(TIME_INTERVAL);
+}
+
+void swModePolling()
+{
+
+  if (digitalRead(SW_CONFIG) == LOW)
+  {
+    int t0 = millis();
+    digitalWrite(2, HIGH);
+    while ((millis() - t0) < 5000)
+      ;
+    Serial.println("Entering Configuration Mode.");
+    initConfigMode();
+    isConfig = true;
+  }
+}
+
+void saveDataLog()
+{
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  if (SYS_SDCARD_CONNECTED)
+  {
+    File dataFile = SD.open("/datalog.txt", FILE_APPEND);
+
+    if (dataFile)
+    {
+      dataFile.println(String(payload));
+      dataFile.close();
+      Serial.println("Datalog has been writed.");
+    }
+    else
+    {
+      Serial.println("error opening datalog.txt");
+    }
+  }
+  else
+  {
+    Serial.println("SDcard is not connect");
+  }
+}
+
+void initNBIoT()
+{
+  NB.debug = true;
+  NB.setupDevice(SERVER_PORT);
+  pingRESP pingR = NB.pingIP(SERVER_IP);
+  Serial.println(F("Arduino NB-IoT Start!"));
+  Serial.print(F("IMEI: "));
+  Serial.println(NB.getIMEI());
+  Serial.print(F("IMSI: "));
+  Serial.println(NB.getIMSI());
+  Serial.println(F("\nNB-IOT attached!"));
+  Serial.print(F("APN: "));
+  Serial.println(NB.getAPN());
+  Serial.print(F("NetworkStatus: "));
+  Serial.println(NB.getNetworkStatus());
+  Serial.print(F("NBConnect: "));
+  Serial.println(NB.getNBConnect());
+  Serial.print(F("Signal RSSI: "));
+  Serial.println(NB.getSignal().rssi);
+  Serial.print(F("Signal CSQ: "));
+  Serial.println(NB.getSignal().csq);
+}
+
+void initSDCard()
+{
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+  for (int i = 0; i < 10; i++)
+  {
+    if (!SD.begin(SS_PIN))
+    {
+      delay(1000);
+      SYS_SDCARD_CONNECTED = 1;
+    }
+    else
+    {
+      SYS_SDCARD_CONNECTED = 0;
+      break;
+    }
+  }
+  Serial.println("initialization done.");
+}
+
+void readSensors()
+{
+  // Wind
+  windSpeedSampling();
+  WIND_DIR_VALUE = analogRead(PIN_WINDDIR);
+  // Solar
+  SOLAR_RADIATION_VALUE = analogRead(PIN_SOLAR_RADIATION);
+  // Soil moisture
+  SOIL_MOISTURE_VALUE_01 = analogRead(PIN_SOIL_MOISTURE_VALUE_01);
+  SOIL_MOISTURE_VALUE_02 = analogRead(PIN_SOIL_MOISTURE_VALUE_02);
+  SOIL_MOISTURE_VALUE_03 = analogRead(PIN_SOIL_MOISTURE_VALUE_03);
+  // CPU Temp
+  SYS_CPU_TEMPERATURE = (temprature_sens_read() - 32) / 1.8;
+  // Air Temp & Humid
+  TEMPERATURE_VALUE = SHT21.getTemperature();
+  HUMIDITY_VALUE = SHT21.getHumidity();
+  // Ultrasonic Water Level
+  WATER_LEVEL_VALUE = pulseIn(PIN_WATER_LEVEL, HIGH) / 58.0;
+}
+
+void setup()
+{
+
+  // For Debug
+  pinMode(2, OUTPUT);
+  digitalWrite(2, LOW);
+
+  Serial.begin(9600);
+
+  initRTC();
+  readRTC();
+  // setRTC();
+
+  // Initialize SPIFFS
+  init();
+  initSetup();
+  initDateTime();
+  initRunMode1();
+  initIntervalTime();
+
+  initRTC();
+  initNBIoT();
+  initSDCard();
+
+  SHT21.begin();
+
+  pinMode(SW_CONFIG, INPUT_PULLUP);
+  pinMode(PIN_WATER_LEVEL, INPUT);
+  // esp_sleep_enable_ext0_wakeup((gpio_num_t)33, LOW);
+  // esp_sleep_enable_timer_wakeup(TIME_WAKEUP);
+  Serial.println("ESP32 Start....");
+  initConfigMode();
+}
+
+void loop()
+{
+  if (isConfig)
+    ;
+  else
+  {
+    digitalWrite(2, HIGH);
+
+    if (TIME_COUNTER >= CONFIG_INTERVAL_TIME)
+    {
+      TIME_COUNTER = 0;
+      digitalWrite(2, LOW);
+      readSensors();
+      readRTC();
+      createDataSet();
+      sendData();
+      saveDataLog();
+      payload = "";
+    }
+    swModePolling();
+  }
+
+
+  // if (TIME_COUNTER >= CONFIG_INTERVAL_TIME)
+  // {
+  //   TIME_COUNTER = 0;
+  //   digitalWrite(2, LOW);
+  //   readSensors();
+  //   readRTC();
+  //   // createDataSet();
+  //   // sendData();
+  //   // saveDataLog();
+  //   payload = "";
+    
+  //   Serial.println(WINDSPEED_COUNTER);
+  //   Serial.println(WINDSPEED_VALUE);
+  //   Serial.println(WIND_DIR_VALUE);
+  //   Serial.println(TEMPERATURE_VALUE);
+  //   Serial.println(HUMIDITY_VALUE);
+  //   Serial.println(WINDSPEED_VALUE);
+  //   Serial.print(WINDSPEED_COUNTER);
+  //   Serial.println(WATER_LEVEL_VALUE);
+  //   Serial.println(RAIN_COUNTER);
+  //   esp_deep_sleep_start();
+  // }
+  // else
+  // {
+  //   // intervalTimeHandler();
+  //   // esp_deep_sleep_start();
+  // }
+}
